@@ -1,0 +1,32 @@
+# ========== Keil MDK-ARM 编译产物 ==========
+MDK-ARM/modbus/
+MDK-ARM/*.lst
+MDK-ARM/*.build_log.htm
+*.o
+*.crf
+*.d
+*.axf
+*.hex
+*.bin
+*.map
+*.lnp
+*.sct
+*.htm
+*.dep
+
+# Keil 个人窗口布局（每台电脑不同，不提交）
+MDK-ARM/*.uvguix.*
+
+# ========== CMake / GCC 构建产物 ==========
+build/
+cmake-build-*/
+out/
+
+# ========== CubeMX 辅助文件 ==========
+.mxproject
+*.ioc.bak
+*.ioc~
+
+# ========== 系统文件 ==========
+.DS_Store
+Thumbs.db
