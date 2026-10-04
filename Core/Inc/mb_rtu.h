@@ -63,6 +63,12 @@ int mbrtu_write_single(uint8_t slave, uint16_t reg, uint16_t value, uint32_t tim
 int mbrtu_write_multiple(uint8_t slave, uint16_t reg, uint16_t count,
                          const uint16_t *values, uint32_t timeout_ms);
 
+/** @brief 诊断：中断累计收到的字节数 */
+uint32_t mbrtu_rx_total(void);
+
+/** @brief 接收自愈：长时间运行后重新挂上 UART 接收（防卡死） */
+void mbrtu_rx_heal(void);
+
 #ifdef __cplusplus
 }
 #endif

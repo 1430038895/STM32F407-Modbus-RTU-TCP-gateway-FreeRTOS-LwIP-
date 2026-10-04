@@ -26,11 +26,14 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
+#include <stdio.h>
 #include "usart.h"
 #include "iwdg.h"
 #include "mb_rtu.h"
 #include "mb_tcp.h"
 #include "mb_gateway.h"
+#include "joystick.h"
+#include "ui.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,7 +68,7 @@ osThreadId_t rs485TaskHandle;
 const osThreadAttr_t rs485Task_attributes = {
   .name = "rs485Task",
   .stack_size = 4096,
-  .priority = (osPriority_t) osPriorityBelowNormal,
+  .priority = (osPriority_t) osPriorityAboveNormal, /* 高于屏幕任务：轮询时不被屏幕打断 */
 };
 
 /** 看门狗任务（检查轮询任务心跳，健康才喂狗） */
@@ -74,6 +77,14 @@ const osThreadAttr_t wdTask_attributes = {
   .name = "wdTask",
   .stack_size = 512,
   .priority = (osPriority_t) osPriorityAboveNormal, /* 高于轮询/网络任务，保证按时喂狗 */
+};
+
+/** 数据导出任务（TCP 5000，给 Python / 屏幕读全部点） */
+osThreadId_t dumpTaskHandle;
+const osThreadAttr_t dumpTask_attributes = {
+  .name = "dumpTask",
+  .stack_size = 4096,
+  .priority = (osPriority_t) osPriorityNormal, /* 要能抢过轮询任务，及时应答 */
 };
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
@@ -133,6 +144,7 @@ void MX_FREERTOS_Init(void) {
   tcpTaskHandle = osThreadNew(StartTcpTask, NULL, &tcpTask_attributes);
   rs485TaskHandle = osThreadNew(StartRs485Task, NULL, &rs485Task_attributes);
   wdTaskHandle = osThreadNew(StartWatchdogTask, NULL, &wdTask_attributes);
+  dumpTaskHandle = osThreadNew(mbgw_dump_task, NULL, &dumpTask_attributes);
   if (tcpTaskHandle == NULL || rs485TaskHandle == NULL)
   {
     HAL_UART_Transmit(&huart1, (uint8_t*)"[RTOS] task create FAILED\r\n",
@@ -158,10 +170,12 @@ void StartDefaultTask(void *argument)
   /* init code for LWIP */
   MX_LWIP_Init();
   /* USER CODE BEGIN StartDefaultTask */
-  /* Infinite loop */
+  st7789_dma_init();         /* 启动屏幕 SPI DMA */
+  ui_init();                 /* 清屏 + 画标题/列表/数据 */
   for(;;)
   {
-    osDelay(1);
+    ui_poll();               /* 摇杆上下切换从机；选中变化时重画 */
+    osDelay(20);
   }
   /* USER CODE END StartDefaultTask */
 }
@@ -252,3 +266,4 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 }
 
 /* USER CODE END Application */
+

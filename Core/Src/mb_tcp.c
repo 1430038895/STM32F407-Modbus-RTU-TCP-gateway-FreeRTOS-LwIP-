@@ -33,6 +33,9 @@
 #define MB_EXC_ILLEGAL_VALUE     0x03
 #define MB_EXC_SLAVE_FAILURE     0x04
 
+/* 1 = 允许 TCP 写穿透到 RS485；0 = 禁止（排查"谁在写"用） */
+#define MB_ALLOW_WRITE   1
+
 /* ================= 工具函数 ================= */
 
 /**
@@ -58,40 +61,47 @@ static void wr_u16(uint8_t *p, uint16_t v)
 }
 
 /**
-  * @brief  从 TCP 流里精确收满 len 字节（解决粘包/分片）
-  * @param  fd   已连接的 socket
-  * @param  buf  接收缓冲
-  * @param  len  需要收满的字节数
-  * @retval >0 实际收到的字节数（=len）；0 对端关闭；-1 出错
+  * @brief  从 TCP 流里精确收满 len 字节（带超时，防止客户端半死把任务卡住）
+  * @param  fd         已连接的 socket（非阻塞）
+  * @param  buf        接收缓冲
+  * @param  len        需要收满的字节数
+  * @param  timeout_ms 总超时（毫秒）
+  * @retval >0 实际收到的字节数；0 对端关闭；-1 超时/出错
   */
-static int recv_exact(int fd, uint8_t *buf, int len)
+static int recv_exact(int fd, uint8_t *buf, int len, int timeout_ms)
 {
   int got = 0;
+  uint32_t t0 = HAL_GetTick();
+
   while (got < len)
   {
     int n = lwip_recv(fd, buf + got, len - got, 0);
-    if (n == 0) return 0;
-    if (n < 0)  return -1;
-    got += n;
+    if (n > 0) { got += n; t0 = HAL_GetTick(); continue; }
+    if (n == 0) return got;                              /* 对端关闭 */
+    if ((HAL_GetTick() - t0) >= (uint32_t)timeout_ms) return -1;  /* 超时 */
+    osDelay(2);
   }
   return got;
 }
 
 /**
-  * @brief  把一段字节发到发完为止（处理 send 只发了一部分）
-  * @param  fd   已连接的 socket
+  * @brief  把一段字节发到发完为止（带超时，处理 send 只发了一部分）
+  * @param  fd   已连接的 socket（非阻塞）
   * @param  buf  待发送数据
   * @param  len  总长度
-  * @retval 0 成功；-1 出错
+  * @retval 0 成功；-1 超时/出错
   */
 static int send_all(int fd, const uint8_t *buf, int len)
 {
   int sent = 0;
+  uint32_t t0 = HAL_GetTick();
+
   while (sent < len)
   {
     int n = lwip_send(fd, (const void *)(buf + sent), len - sent, 0);
-    if (n <= 0) return -1;
-    sent += n;
+    if (n > 0) { sent += n; t0 = HAL_GetTick(); continue; }
+    if ((HAL_GetTick() - t0) >= 5000U) return -1;
+    osDelay(2);
   }
   return 0;
 }
@@ -181,6 +191,18 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
         *p++ = MB_EXC_ILLEGAL_ADDRESS;
         break;
       }
+#if (MB_ALLOW_WRITE == 0)
+      *p++ = (uint8_t)(func | 0x80);
+      *p++ = MB_EXC_ILLEGAL_FUNCTION;
+      break;
+#else
+      {
+        char b[80];
+        int n = snprintf(b, sizeof(b), "[MB] WRITE06 uid=%u addr=%u val=%u\r\n",
+                         (unsigned)uid, (unsigned)addr, (unsigned)val);
+        HAL_UART_Transmit(&huart1, (uint8_t*)b, (uint16_t)n, HAL_MAX_DELAY);
+      }
+#endif
       if (mbgw_write_single(uid, addr, val) != 0)
       {
         *p++ = (uint8_t)(func | 0x80);
@@ -218,6 +240,18 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
         vals[j] = rd_u16(req + 13 + j * 2);   /* PDU 数据从下标 13 开始 */
       }
 
+#if (MB_ALLOW_WRITE == 0)
+      *p++ = (uint8_t)(func | 0x80);
+      *p++ = MB_EXC_ILLEGAL_FUNCTION;
+      break;
+#else
+      {
+        char b[80];
+        int n = snprintf(b, sizeof(b), "[MB] WRITE10 uid=%u start=%u qty=%u\r\n",
+                         (unsigned)uid, (unsigned)start, (unsigned)qty);
+        HAL_UART_Transmit(&huart1, (uint8_t*)b, (uint16_t)n, HAL_MAX_DELAY);
+      }
+#endif
       if (mbgw_write_multiple(uid, start, qty, vals) != 0)
       {
         *p++ = (uint8_t)(func | 0x80);
@@ -310,14 +344,20 @@ void mbtcp_task(void *argument)
       HAL_UART_Transmit(&huart1, (uint8_t*)line, (uint16_t)len, HAL_MAX_DELAY);
     }
 
+    /* 设为非阻塞：收/发都由上面的带超时循环处理，客户端半死不会卡住本任务 */
+    {
+      int nb = 1;
+      (void)lwip_ioctl(conn_fd, FIONBIO, &nb);
+    }
+
     /* 同一条连接上反复处理请求，直到对端关闭 */
     for (;;)
     {
       uint16_t pid, alen;
       int pdu_len, rlen, r;
 
-      /* 1) 先收 7 字节 MBAP，取出“长度”字段 */
-      r = recv_exact(conn_fd, req, 7);
+      /* 1) 先收 7 字节 MBAP，取出“长度”字段（空闲最多等 30s） */
+      r = recv_exact(conn_fd, req, 7, 30000);
       if (r <= 0) break;
 
       pid  = rd_u16(req + 2);
@@ -328,9 +368,9 @@ void mbtcp_task(void *argument)
         break;                           /* 非法帧，断开连接 */
       }
 
-      /* 2) 再收 PDU（alen-1 字节） */
+      /* 2) 再收 PDU（alen-1 字节，帧内很快，最多等 2s） */
       pdu_len = (int)alen - 1;
-      r = recv_exact(conn_fd, req + 7, pdu_len);
+      r = recv_exact(conn_fd, req + 7, pdu_len, 2000);
       if (r <= 0) break;
 
       /* 3) 解析并生成应答 */

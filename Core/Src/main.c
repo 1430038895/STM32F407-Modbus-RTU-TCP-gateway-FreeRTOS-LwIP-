@@ -19,14 +19,18 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+#include "adc.h"
 #include "iwdg.h"
 #include "lwip.h"
+#include "spi.h"
 #include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <string.h>
+#include "st7789.h"
+#include "joystick.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -94,9 +98,18 @@ int main(void)
   MX_USART1_UART_Init();
   MX_UART5_Init();
   MX_IWDG_Init();
+  MX_ADC1_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
   HAL_UART_Transmit(&huart1, (uint8_t*)"\r\n[BOOT] FreeRTOS (CMSIS v2) starting...\r\n",
                     (uint16_t)strlen("\r\n[BOOT] FreeRTOS (CMSIS v2) starting...\r\n"), HAL_MAX_DELAY);
+
+  /* ST7789 屏幕自检：红->黑->左上蓝+右下绿 */
+  st7789_init();
+  st7789_fill(ST7789_RED);      HAL_Delay(500);
+  st7789_fill(ST7789_BLACK);
+  st7789_fill_rect(0,   0,   120, 160, ST7789_BLUE);
+  st7789_fill_rect(120, 160, 120, 160, ST7789_GREEN);
   /* USER CODE END 2 */
 
   /* Init scheduler */

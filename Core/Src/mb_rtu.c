@@ -2,18 +2,18 @@
   ******************************************************************************
   * @file    mb_rtu.c
   * @brief   Modbus RTU 主站（下行侧）：RS485 收发 + CRC + 主站读写
-  * @note    依赖：UART5(RS485) + PD1(收发方向) + 独立总线互斥锁。
-  ******************************************************************************
+  * @note    依赖：UART5(RS485) + PD1(收发方向) + 独立总线互斥锁�?  ******************************************************************************
   */
 
 #include "main.h"
+
 #include "usart.h"
 #include "cmsis_os.h"
 #include <string.h>
 #include <stdio.h>
 #include "mb_rtu.h"
 
-/* ================= RS485 物理层（UART5 + PD1 方向控制） ================= */
+/* ================= RS485 物理层（UART5 + PD1 方向控制�?================= */
 
 #define RS485_EN_PORT   GPIOD
 #define RS485_EN_PIN    GPIO_PIN_1
@@ -24,13 +24,54 @@
 /** 保护 RS485 总线的互斥锁（轮询与写转发互斥使用） */
 static osMutexId_t s_busMutex;
 
+/* ---- 接收：中断 + 环形缓冲（115200 下也不会因为调度丢字节） ---- */
+#define RS485_RXBUFSZ   512                 /* 环形缓冲大小，必须是 2 的幂 */
+#define RS485_RXMASK    (RS485_RXBUFSZ - 1)
+#define RS485_GAP_MS    0                    /* 帧间静默：响应往返本身就提供了间隔，设为 0 */
+
+static uint8_t          s_rxbuf[RS485_RXBUFSZ];  /* 环形接收缓冲 */
+static volatile uint16_t s_rx_head = 0;          /* 中断写入位置 */
+static volatile uint16_t s_rx_tail = 0;          /* 任务读取位置 */
+static uint8_t          s_rxbyte;                /* 逐字节接收的暂存 */
+static volatile uint32_t s_rx_total = 0;         /* 中断累计收到的字节数（诊断用） */
+
+/** @brief 环形缓冲里还有几个字节可读 */
+static inline uint16_t rs485_avail(void)
+{
+  return (uint16_t)((s_rx_head - s_rx_tail) & RS485_RXMASK);
+}
+
+/** @brief 中断收到一个字节：入缓冲并重新挂上接收 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == UART5)
+  {
+    s_rxbuf[s_rx_head & RS485_RXMASK] = s_rxbyte;
+    s_rx_head = (uint16_t)((s_rx_head + 1) & RS485_RXMASK);
+    s_rx_total++;
+    HAL_UART_Receive_IT(&huart5, &s_rxbyte, 1);
+  }
+}
+
+/** @brief 接收出错（溢出等）：清标志并重新挂上接收 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == UART5)
+  {
+    __HAL_UART_CLEAR_OREFLAG(&huart5);
+    HAL_UART_Receive_IT(&huart5, &s_rxbyte, 1);
+  }
+}
+
+/** @brief UART5 中断入口（代码里自带，不用在 CubeMX 里勾选） */
+void UART5_IRQHandler(void)
+{
+  HAL_UART_IRQHandler(&huart5);
+}
+
 /**
-  * @brief   通过 RS485 发送一帧（自动切换收发方向）
-  * @param   data  待发送数据
-  * @param   len   长度
-  * @retval  0  成功；-1 UART 发送失败
-  * @note    拉高 EN(发送) -> UART 发送 -> 等 TC(发完) -> 拉低 EN(接收)。
-  */
+  * @brief   通过 RS485 发送一帧（自动切换收发方向�?  * @param   data  待发送数�?  * @param   len   长度
+  * @retval  0  成功�?1 UART 发送失�?  * @note    拉高 EN(发�? -> UART 发�?-> �?TC(发完) -> 拉低 EN(接收)�?  */
 static int rs485_send(const uint8_t *data, uint16_t len)
 {
   RS485_TX();
@@ -39,47 +80,93 @@ static int rs485_send(const uint8_t *data, uint16_t len)
     RS485_RX();
     return -1;
   }
-  while (!(UART5->SR & USART_SR_TC)) { }   /* 等最后一字节发完，否则会截断 */
+  {
+    uint32_t t0 = HAL_GetTick();
+    while (!(UART5->SR & USART_SR_TC))
+    {
+      if ((HAL_GetTick() - t0) > 20) break;   /* 最多等 20ms，防死等 */
+    }
+  }
   RS485_RX();
   return 0;
 }
 
 /**
-  * @brief   按“静默时间”接收一帧（RTU 无长度字段，靠 3.5 字符静默分帧）
-  * @param   buf              接收缓冲
-  * @param   maxlen           缓冲容量上限（不是期望长度）
-  * @param   first_timeout_ms 等第一个字节的最长时间（毫秒）
-  * @retval  实际收到的字节数；0 表示超时没收到任何字节
+  * @brief   �?n 个字节（每字节最多等 to_ms 毫秒�?  * @param   buf  接收缓冲
+  * @param   n    要收的字节数
+  * @param   to_ms 每字节超时（毫秒�?  * @retval  实际收到的字节数
   */
-static int rs485_recv(uint8_t *buf, uint16_t maxlen, uint32_t first_timeout_ms)
+static int rs485_recv_n(uint8_t *buf, int n, uint32_t to_ms)
 {
-  uint8_t b;
-  int len = 0;
-
-  if (HAL_UART_Receive(&huart5, &b, 1, first_timeout_ms) != HAL_OK)
+  int got = 0;
+  while (got < n)
   {
-    return 0;
-  }
-  buf[len++] = b;
-
-  while (len < (int)maxlen)
-  {
-    if (HAL_UART_Receive(&huart5, &b, 1, 4) != HAL_OK)
+    uint32_t t0 = HAL_GetTick();
+    while (rs485_avail() == 0)
     {
-      break;   /* 4ms 静默 -> 帧结束（9600 下 3.5 字符约 3.6ms） */
+      if ((HAL_GetTick() - t0) >= to_ms) return got;    /* 每个字节最多等 to_ms */
+      osDelay(1);                                        /* 让出 CPU 给屏幕等低优先级任务 */
     }
-    buf[len++] = b;
+    buf[got++] = s_rxbuf[s_rx_tail & RS485_RXMASK];     /* 从环形缓冲取一个 */
+    s_rx_tail = (uint16_t)((s_rx_tail + 1) & RS485_RXMASK);
   }
-  return len;
+  return got;
 }
 
 /**
-  * @brief   把一段字节以 HEX 形式打印到调试串口（USART1）
-  * @param   tag   前缀文字
+  * @brief   清空 RX 残留（发送新请求前调用，避免上一帧的尾巴污染本帧�?  * @retval  �?  */
+static void rs485_flush_rx(void)
+{
+  __HAL_UART_CLEAR_OREFLAG(&huart5);           /* 清溢出等错误标志 */
+  s_rx_tail = s_rx_head;                        /* 丢弃环形缓冲里的所有残留 */
+#if (RS485_GAP_MS > 0)
+  osDelay(RS485_GAP_MS);                        /* 帧间静默（响应往返已提供间隔，默认不延时） */
+#endif
+}
+
+/**
+  * @brief   按“已知长度”读完整一帧应答（先对齐帧头，再按功能码定长）
+  * @param   buf       接收缓冲
+  * @param   maxlen    缓冲容量
+  * @param   slave     期望的从机地址
+  * @param   first_to  等第一个字节的最长时间（毫秒�?  * @retval  实际收到的总字节数�? 表示从机没应�?  * @note    第一个字节必须是 slave，否则跳过（引导杂波）；异常�?5 字节�?  *          0x03/0x04 应答 = 3 + 字节�?+ 2�?x06/0x10 应答 = 8 字节�?  */
+static int rs485_recv_resp(uint8_t *buf, uint16_t maxlen, uint8_t slave, uint32_t first_to)
+{
+  int got, skip;
+
+  got = rs485_recv_n(buf, 1, first_to);        /* 等第一个字�?*/
+  if (got < 1) return 0;
+
+  for (skip = 0; buf[0] != slave && skip < 8; skip++)
+  {
+    if (rs485_recv_n(buf, 1, 50) < 1) return 0;  /* 跳过引导杂波 */
+  }
+  if (buf[0] != slave) return 1;
+
+  if (rs485_recv_n(buf + 1, 1, 50) < 1) return 1;   /* 功能�?*/
+
+  if (buf[1] & 0x80)                                /* 异常应答：还需 3 字节 */
+  {
+    return 2 + rs485_recv_n(buf + 2, 3, 50);
+  }
+
+  if (buf[1] == 0x03 || buf[1] == 0x04)             /* 读应�?*/
+  {
+    int bc;
+    if (rs485_recv_n(buf + 2, 1, 50) < 1) return 2;
+    bc = buf[2];
+    if (bc > (int)maxlen - 5) bc = (int)maxlen - 5;
+    return 3 + rs485_recv_n(buf + 3, bc + 2, 50);
+  }
+
+  return 2 + rs485_recv_n(buf + 2, 6, 50);          /* 0x06/0x10 应答 = 8 字节 */
+}
+
+/**
+  * @brief   把一段字节以 HEX 形式打印到调试串口（USART1�?  * @param   tag   前缀文字
   * @param   data  数据
   * @param   len   长度
-  * @retval  无
-  */
+  * @retval  �?  */
 static void rs485_print(const char *tag, const uint8_t *data, int len)
 {
   char line[200];
@@ -94,10 +181,9 @@ static void rs485_print(const char *tag, const uint8_t *data, int len)
 }
 
 /**
-  * @brief   计算 Modbus CRC16（多项式 0xA001，初值 0xFFFF）
-  * @param   data  数据
+  * @brief   计算 Modbus CRC16（多项式 0xA001，初�?0xFFFF�?  * @param   data  数据
   * @param   len   长度
-  * @retval  16 位 CRC 值；发送时“低字节在前”追加到帧尾
+  * @retval  16 �?CRC 值；发送时“低字节在前”追加到帧尾
   */
 static uint16_t modbus_crc16(const uint8_t *data, uint16_t len)
 {
@@ -120,7 +206,31 @@ static uint16_t modbus_crc16(const uint8_t *data, uint16_t len)
 
 void mbrtu_init(void)
 {
+  HAL_StatusTypeDef st;
+  char b[64];
+  int n;
+
   s_busMutex = osMutexNew(NULL);
+
+  /* 打开 UART5 全局中断，并启动逐字节中断接收 */
+  HAL_NVIC_SetPriority(UART5_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(UART5_IRQn);
+  st = HAL_UART_Receive_IT(&huart5, &s_rxbyte, 1);
+
+  n = snprintf(b, sizeof(b), "[RTU] UART5 RX-IT start: st=%d (0=OK)\r\n", (int)st);
+  HAL_UART_Transmit(&huart1, (uint8_t *)b, (uint16_t)n, HAL_MAX_DELAY);
+}
+
+uint32_t mbrtu_rx_total(void) { return s_rx_total; }
+
+/* 自愈：若 RXNE 中断被关了、或接收状态异常，重新挂上（长时间运行防卡死） */
+void mbrtu_rx_heal(void)
+{
+  if ((UART5->CR1 & USART_CR1_RXNEIE) == 0U || huart5.RxState != HAL_UART_STATE_BUSY_RX)
+  {
+    __HAL_UART_CLEAR_OREFLAG(&huart5);
+    (void)HAL_UART_Receive_IT(&huart5, &s_rxbyte, 1);
+  }
 }
 
 int mbrtu_read(uint8_t slave, uint8_t func, uint16_t start, uint16_t count,
@@ -143,31 +253,34 @@ int mbrtu_read(uint8_t slave, uint8_t func, uint16_t start, uint16_t count,
   req[6] = (uint8_t)(crc & 0xFF);
   req[7] = (uint8_t)(crc >> 8);
 
-  /* 2~3. 总线互斥：发送 + 接收独占总线 */
+  /* 2~3. 总线互斥：发�?+ 接收独占总线 */
   osMutexAcquire(s_busMutex, osWaitForever);
 
+  rs485_flush_rx();                             /* 清掉上一次的残留 */
   if (rs485_send(req, 8) != 0)
   {
     osMutexRelease(s_busMutex);
     return -1;
   }
 
-  rxlen = rs485_recv(resp, sizeof(resp), timeout_ms);
+  rxlen = rs485_recv_resp(resp, sizeof(resp), slave, timeout_ms);
 
   osMutexRelease(s_busMutex);
 
   if (rxlen < 5)
   {
+    rs485_print("[RTU] no resp:", resp, (rxlen > 0) ? rxlen : 0);
     return -2;
   }
 
   /* 4. 从机地址必须匹配 */
   if (resp[0] != slave)
   {
+    rs485_print("[RTU] addr mismatch:", resp, rxlen);
     return -3;
   }
 
-  /* 5. CRC 必须对 */
+  /* 5. CRC 必须�?*/
   crc = modbus_crc16(resp, (uint16_t)(rxlen - 2));
   if ((resp[rxlen - 2] != (uint8_t)(crc & 0xFF)) ||
       (resp[rxlen - 1] != (uint8_t)(crc >> 8)))
@@ -187,7 +300,7 @@ int mbrtu_read(uint8_t slave, uint8_t func, uint16_t start, uint16_t count,
     return -6;
   }
 
-  /* 7. 字节数校验 + 取数据（大端） */
+  /* 7. 字节数校�?+ 取数据（大端�?*/
   if (resp[2] != (uint8_t)(count * 2))
   {
     return -7;
@@ -218,15 +331,16 @@ int mbrtu_write_single(uint8_t slave, uint16_t reg, uint16_t value, uint32_t tim
   req[7] = (uint8_t)(crc >> 8);
 
   osMutexAcquire(s_busMutex, osWaitForever);
+  rs485_flush_rx();
   if (rs485_send(req, 8) != 0)
   {
     osMutexRelease(s_busMutex);
     return -1;
   }
-  rxlen = rs485_recv(resp, sizeof(resp), timeout_ms);
+  rxlen = rs485_recv_resp(resp, sizeof(resp), slave, timeout_ms);
   osMutexRelease(s_busMutex);
 
-  if (rxlen < 8)
+  if (rxlen < 5)
   {
     return -2;
   }
@@ -286,15 +400,16 @@ int mbrtu_write_multiple(uint8_t slave, uint16_t reg, uint16_t count,
   reqlen += 2;
 
   osMutexAcquire(s_busMutex, osWaitForever);
+  rs485_flush_rx();
   if (rs485_send(req, (uint16_t)reqlen) != 0)
   {
     osMutexRelease(s_busMutex);
     return -1;
   }
-  rxlen = rs485_recv(resp, sizeof(resp), timeout_ms);
+  rxlen = rs485_recv_resp(resp, sizeof(resp), slave, timeout_ms);
   osMutexRelease(s_busMutex);
 
-  if (rxlen < 8)
+  if (rxlen < 5)
   {
     return -2;
   }

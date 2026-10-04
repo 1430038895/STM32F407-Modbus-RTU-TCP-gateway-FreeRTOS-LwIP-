@@ -110,6 +110,23 @@
 /*-----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
 
+/* 加大 lwIP 内存与 TCP 缓冲：默认 TCP_SND_BUF=2*TCP_MSS=1072、MEM_SIZE=1600，
+   一次发几 KB 会因缓冲/堆不足而随机失败。这里放大，发送就稳了。 */
+#undef  TCP_SND_QUEUELEN
+
+#define MEM_SIZE                (16 * 1024)                 /* lwIP 内存堆 */
+#define TCP_MSS                 (1460)                      /* 以太网 MSS */
+#define TCP_WND                 (6 * TCP_MSS)               /* 接收窗口 ~8.7KB */
+#define TCP_SND_BUF             (6 * TCP_MSS)               /* 发送缓冲 ~8.7KB */
+#define TCP_SND_QUEUELEN        ((4 * TCP_SND_BUF + (TCP_MSS - 1)) / TCP_MSS)
+#define MEMP_NUM_TCP_SEG        (TCP_SND_QUEUELEN + 4)
+#define PBUF_POOL_SIZE          (16)
+
+/* 增大 TCP 连接/资源上限，避免长时间运行被"连接数"撑爆 */
+#define MEMP_NUM_TCP_PCB            16
+#define MEMP_NUM_TCP_PCB_TIME_WAIT  16
+#define MEMP_NUM_NETCONN            24
+
 /* USER CODE END 1 */
 
 #ifdef __cplusplus
