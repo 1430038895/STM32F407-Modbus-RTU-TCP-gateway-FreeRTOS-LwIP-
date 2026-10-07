@@ -1,7 +1,8 @@
 /**
   ******************************************************************************
   * @file    mb_rtu.h
-  * @brief   Modbus RTU 主站（下行侧）：RS485 收发 + CRC + 主站读写
+  * @brief   Modbus RTU 主站（下行侧）对外接口：RS485 收发 + CRC + 主站读写
+  * @note    面向对象是"从机"；对外只暴露：初始化、主站读/写、诊断/自愈。
   ******************************************************************************
   */
 #ifndef __MB_RTU_H
@@ -14,15 +15,16 @@ extern "C" {
 #include <stdint.h>
 
 /**
-  * @brief  初始化 RTU 模块（创建总线互斥锁）
+  * @brief  初始化 RTU 模块
   * @param  无
   * @retval 无
-  * @note   必须在创建任务前调用。
+  * @note   创建总线互斥锁，打开 UART5 全局中断并启动单字节中断接收。
+  *         必须在创建任务之前调用。
   */
 void mbrtu_init(void);
 
 /**
-  * @brief  Modbus RTU 主站：读寄存器（功能码 0x03 保持 / 0x04 输入）
+  * @brief  Modbus RTU 主站：读寄存器（0x03 保持 / 0x04 输入）
   * @param  slave       从机地址（1~247）
   * @param  func        功能码：0x03=保持寄存器，0x04=输入寄存器
   * @param  start       起始寄存器地址
@@ -47,7 +49,7 @@ int mbrtu_read(uint8_t slave, uint8_t func, uint16_t start, uint16_t count,
   * @param  reg         寄存器地址
   * @param  value       要写入的 16 位值
   * @param  timeout_ms  等待应答超时（毫秒）
-  * @retval 0 成功；负值同 mbrtu_read（-1..-6）
+  * @retval 0=成功；负值同 mbrtu_read（-1..-6）
   */
 int mbrtu_write_single(uint8_t slave, uint16_t reg, uint16_t value, uint32_t timeout_ms);
 
@@ -58,15 +60,23 @@ int mbrtu_write_single(uint8_t slave, uint16_t reg, uint16_t value, uint32_t tim
   * @param  count       寄存器个数（1~123）
   * @param  values      要写入的值数组（长度 >= count）
   * @param  timeout_ms  等待应答超时（毫秒）
-  * @retval 0 成功；负值同 mbrtu_read（-1..-6），-8 参数非法
+  * @retval 0=成功；负值同 mbrtu_read（-1..-6）；-8=参数非法
   */
 int mbrtu_write_multiple(uint8_t slave, uint16_t reg, uint16_t count,
                          const uint16_t *values, uint32_t timeout_ms);
 
-/** @brief 诊断：中断累计收到的字节数 */
+/**
+  * @brief  诊断：中断累计收到的字节数
+  * @param  无
+  * @retval 累计字节数
+  */
 uint32_t mbrtu_rx_total(void);
 
-/** @brief 接收自愈：长时间运行后重新挂上 UART 接收（防卡死） */
+/**
+  * @brief  接收自愈：长时间运行后重新挂上 UART 接收（防卡死）
+  * @param  无
+  * @retval 无
+  */
 void mbrtu_rx_heal(void);
 
 #ifdef __cplusplus

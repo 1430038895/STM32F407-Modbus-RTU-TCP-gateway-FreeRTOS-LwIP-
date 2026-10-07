@@ -2,8 +2,9 @@
   ******************************************************************************
   * @file    mb_tcp.c
   * @brief   Modbus TCP 从站（上行侧）：MBAP 解析、功能码分派、数据读写
-  * @note    单元号路由：TCP 单元号=从机号，地址=从机寄存器地址；
-  *         读走网关缓存，写走"写穿透"（mb_gateway）。
+  * @note    地址映射：TCP "单元号" = 从机号，"寄存器地址" = 从机寄存器地址。
+  *          读 -> 从网关镜像取（mbgw_read）；写 -> 写穿透到 RS485 从机（mbgw_write_*）。
+  *          收发带超时、客户端非阻塞，避免"半死"连接把任务卡住。
   ******************************************************************************
   */
 
@@ -18,22 +19,22 @@
 
 /* ================= 常量 ================= */
 
-#define MODBUS_TCP_PORT   502      /* Modbus TCP 标准端口 */
-#define MODBUS_MAX_ADU    260      /* Modbus TCP ADU 最大字节数 */
+#define MODBUS_TCP_PORT   502      /**< Modbus TCP 标准端口 */
+#define MODBUS_MAX_ADU    260      /**< Modbus TCP ADU 最大字节数（MBAP 7 + PDU 253） */
 
 /* 功能码 */
-#define MB_FUNC_READ_HOLDING   0x03
-#define MB_FUNC_READ_INPUT     0x04
-#define MB_FUNC_WRITE_REG      0x06
-#define MB_FUNC_WRITE_MULTI    0x10
+#define MB_FUNC_READ_HOLDING   0x03    /**< 读保持寄存器 */
+#define MB_FUNC_READ_INPUT     0x04    /**< 读输入寄存器 */
+#define MB_FUNC_WRITE_REG      0x06    /**< 写单个保持寄存器 */
+#define MB_FUNC_WRITE_MULTI    0x10    /**< 写多个保持寄存器 */
 
-/* 异常码（应答时功能码 | 0x80，数据段放异常码） */
-#define MB_EXC_ILLEGAL_FUNCTION  0x01
-#define MB_EXC_ILLEGAL_ADDRESS   0x02
-#define MB_EXC_ILLEGAL_VALUE     0x03
-#define MB_EXC_SLAVE_FAILURE     0x04
+/* 异常码（应答时：功能码|0x80，数据段放异常码） */
+#define MB_EXC_ILLEGAL_FUNCTION  0x01   /**< 非法功能码 */
+#define MB_EXC_ILLEGAL_ADDRESS   0x02   /**< 非法数据地址 */
+#define MB_EXC_ILLEGAL_VALUE     0x03   /**< 非法数据值 */
+#define MB_EXC_SLAVE_FAILURE     0x04   /**< 从机故障/未就绪 */
 
-/* 1 = 允许 TCP 写穿透到 RS485；0 = 禁止（排查"谁在写"用） */
+/** 写穿透总开关：1=允许 TCP 写转发到 RS485；0=禁止（排查"谁在写"时用） */
 #define MB_ALLOW_WRITE   1
 
 /* ================= 工具函数 ================= */
@@ -67,17 +68,18 @@ static void wr_u16(uint8_t *p, uint16_t v)
   * @param  len        需要收满的字节数
   * @param  timeout_ms 总超时（毫秒）
   * @retval >0 实际收到的字节数；0 对端关闭；-1 超时/出错
+  * @note   非阻塞 socket：无数据时 lwip_recv 返回 -1，这里 osDelay 后重试直到超时。
   */
 static int recv_exact(int fd, uint8_t *buf, int len, int timeout_ms)
 {
-  int got = 0;
-  uint32_t t0 = HAL_GetTick();
+  int got = 0;                         /* 已收到字节数 */
+  uint32_t t0 = HAL_GetTick();         /* 本次收的开始时刻（收到数据会刷新） */
 
   while (got < len)
   {
     int n = lwip_recv(fd, buf + got, len - got, 0);
-    if (n > 0) { got += n; t0 = HAL_GetTick(); continue; }
-    if (n == 0) return got;                              /* 对端关闭 */
+    if (n > 0) { got += n; t0 = HAL_GetTick(); continue; }        /* 有数据：进度刷新 */
+    if (n == 0) return got;                                       /* 对端关闭 */
     if ((HAL_GetTick() - t0) >= (uint32_t)timeout_ms) return -1;  /* 超时 */
     osDelay(2);
   }
@@ -89,18 +91,18 @@ static int recv_exact(int fd, uint8_t *buf, int len, int timeout_ms)
   * @param  fd   已连接的 socket（非阻塞）
   * @param  buf  待发送数据
   * @param  len  总长度
-  * @retval 0 成功；-1 超时/出错
+  * @retval 0=成功；-1=超时/出错
   */
 static int send_all(int fd, const uint8_t *buf, int len)
 {
-  int sent = 0;
+  int sent = 0;                        /* 已发送字节数 */
   uint32_t t0 = HAL_GetTick();
 
   while (sent < len)
   {
     int n = lwip_send(fd, (const void *)(buf + sent), len - sent, 0);
     if (n > 0) { sent += n; t0 = HAL_GetTick(); continue; }
-    if ((HAL_GetTick() - t0) >= 5000U) return -1;
+    if ((HAL_GetTick() - t0) >= 5000U) return -1;   /* 5s 发不完则失败 */
     osDelay(2);
   }
   return 0;
@@ -111,18 +113,18 @@ static int send_all(int fd, const uint8_t *buf, int len)
   * @param  req      收到的完整请求帧（MBAP + PDU）
   * @param  req_len  请求帧长度（当前实现未使用）
   * @param  resp     应答缓冲（至少 MODBUS_MAX_ADU 字节）
-  * @retval >0 应答帧长度；0 请求应被忽略（如协议号不为 0）
-  * @note   单元号路由：TCP 单元号=从机号，地址=从机寄存器地址。
-  *         读走 mbgw_read（缓存），写走 mbgw_write_*（写穿透）。
+  * @retval >0 应答帧长度；0 请求应被忽略（协议号不为 0）
+  * @note   支持 0x03/0x04（读，走缓存）与 0x06/0x10（写，写穿透）。
+  *         帧格式：MBAP(7) = 事务号(2)+协议号(2)+长度(2)+单元号(1)；其后为 PDU。
   */
 static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
 {
-  uint16_t tid = rd_u16(req);        /* 事务号 */
-  uint16_t pid = rd_u16(req + 2);    /* 协议号 */
-  uint8_t  uid = req[6];             /* 单元号 = 从机号 */
-  uint8_t  func = req[7];            /* 功能码 */
-  uint8_t *pdu;
-  uint8_t *p;
+  uint16_t tid  = rd_u16(req);        /* 事务号（应答原样回） */
+  uint16_t pid  = rd_u16(req + 2);    /* 协议号（必须为 0） */
+  uint8_t  uid  = req[6];             /* 单元号 = 从机号 */
+  uint8_t  func = req[7];             /* 功能码 */
+  uint8_t *pdu;                       /* 指向应答 PDU 起始（resp+7） */
+  uint8_t *p;                         /* 应答 PDU 写指针 */
   int pdu_len;
   int i;
 
@@ -130,10 +132,10 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
 
   if (pid != 0)
   {
-    return 0;                        /* 协议号必须为 0 */
+    return 0;                        /* 协议号必须为 0，否则忽略 */
   }
 
-  /* ---- 填 MBAP 头，长度稍后补 ---- */
+  /* ---- 填 MBAP 头（长度字段稍后补） ---- */
   wr_u16(resp, tid);
   wr_u16(resp + 2, 0);
   resp[6] = uid;
@@ -145,9 +147,9 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
     case MB_FUNC_READ_HOLDING:
     case MB_FUNC_READ_INPUT:
     {
-      uint16_t start = rd_u16(req + 8);
-      uint16_t qty   = rd_u16(req + 10);
-      uint16_t vals[125];
+      uint16_t start = rd_u16(req + 8);    /* 起始寄存器地址 */
+      uint16_t qty   = rd_u16(req + 10);   /* 读取寄存器个数 */
+      uint16_t vals[125];                  /* 暂存读到的寄存器 */
 
       if (qty < 1 || qty > 125)
       {
@@ -171,7 +173,7 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
       *p++ = func;
       *p++ = (uint8_t)(qty * 2);          /* 字节数 = 寄存器数 × 2 */
 
-      mbgw_read(uid, start, qty, vals);
+      mbgw_read(uid, start, qty, vals);   /* 从缓存取 */
       for (i = 0; i < (int)qty; i++)
       {
         wr_u16(p, vals[i]);
@@ -182,8 +184,8 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
 
     case MB_FUNC_WRITE_REG:
     {
-      uint16_t addr = rd_u16(req + 8);
-      uint16_t val  = rd_u16(req + 10);
+      uint16_t addr = rd_u16(req + 8);    /* 寄存器地址 */
+      uint16_t val  = rd_u16(req + 10);   /* 写入值 */
 
       if (uid < 1 || uid > MB_MAX_SLAVE || addr >= MB_MAX_REGS)
       {
@@ -203,7 +205,7 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
         HAL_UART_Transmit(&huart1, (uint8_t*)b, (uint16_t)n, HAL_MAX_DELAY);
       }
 #endif
-      if (mbgw_write_single(uid, addr, val) != 0)
+      if (mbgw_write_single(uid, addr, val) != 0)   /* 写穿透 */
       {
         *p++ = (uint8_t)(func | 0x80);
         *p++ = MB_EXC_SLAVE_FAILURE;
@@ -217,9 +219,9 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
 
     case MB_FUNC_WRITE_MULTI:             /* 0x10 写多个保持寄存器 */
     {
-      uint16_t start = rd_u16(req + 8);
-      uint16_t qty   = rd_u16(req + 10);
-      uint8_t  bc    = req[12];           /* 字节数 */
+      uint16_t start = rd_u16(req + 8);   /* 起始寄存器地址 */
+      uint16_t qty   = rd_u16(req + 10);  /* 写入寄存器个数 */
+      uint8_t  bc    = req[12];           /* 字节数 = qty*2 */
       uint16_t vals[123];                 /* 0x10 单次最多 123 个 */
       int j;
 
@@ -252,7 +254,7 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
         HAL_UART_Transmit(&huart1, (uint8_t*)b, (uint16_t)n, HAL_MAX_DELAY);
       }
 #endif
-      if (mbgw_write_multiple(uid, start, qty, vals) != 0)
+      if (mbgw_write_multiple(uid, start, qty, vals) != 0)   /* 写穿透 */
       {
         *p++ = (uint8_t)(func | 0x80);
         *p++ = MB_EXC_SLAVE_FAILURE;
@@ -272,32 +274,32 @@ static int modbus_handle(const uint8_t *req, int req_len, uint8_t *resp)
   }
 
   pdu_len = (int)(p - pdu);
-  wr_u16(resp + 4, (uint16_t)(pdu_len + 1));  /* 长度 = 单元号 + PDU */
-  return 7 + pdu_len;
+  wr_u16(resp + 4, (uint16_t)(pdu_len + 1));  /* 长度字段 = 单元号(1) + PDU */
+  return 7 + pdu_len;                         /* 总长度 = MBAP(7) + PDU */
 }
 
 /* ================= 服务器任务 ================= */
 
 /**
-  * @brief  Modbus TCP 服务器任务（上行，对电脑）
+  * @brief  Modbus TCP 服务器任务（任务永不返回）
   * @param  argument  未使用
-  * @retval 无（任务永不返回）
-  * @note   监听 502，accept 一条连接后反复"收请求 -> modbus_handle -> 发应答"，
-  *         直到对端关闭；当前一次只服务一个客户端。
+  * @retval 无
+  * @note   监听 502；一次只服务一个客户端；同一条连接上反复"收请求 -> 处理 -> 发应答"，
+  *         直到对端关闭；客户端套接字非阻塞 + 收发带超时，不会被"半死"连接卡住。
   */
 void mbtcp_task(void *argument)
 {
-  int listen_fd;
-  int conn_fd;
-  struct sockaddr_in addr;
-  struct sockaddr_in cli;
+  int listen_fd;                        /* 监听套接字 */
+  int conn_fd;                          /* 当前客户端套接字 */
+  struct sockaddr_in addr;              /* 本机监听地址 */
+  struct sockaddr_in cli;               /* 客户端地址（打印用） */
   socklen_t cli_len;
-  uint8_t req[MODBUS_MAX_ADU];
-  uint8_t resp[MODBUS_MAX_ADU];
+  uint8_t req[MODBUS_MAX_ADU];          /* 请求缓冲 */
+  uint8_t resp[MODBUS_MAX_ADU];         /* 应答缓冲 */
 
   (void)argument;
 
-  /* ---- 服务器五步的前三步（只做一次） ---- */
+  /* ---- 服务器五步的前三步（只做一次）：socket / bind / listen ---- */
   listen_fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd < 0)
   {
@@ -324,7 +326,7 @@ void mbtcp_task(void *argument)
   HAL_UART_Transmit(&huart1, (uint8_t*)"[MB] Modbus TCP listening on 502\r\n",
                     (uint16_t)strlen("[MB] Modbus TCP listening on 502\r\n"), HAL_MAX_DELAY);
 
-  /* ---- 主循环 ---- */
+  /* ---- 主循环：accept 一个客户端并服务 ---- */
   for (;;)
   {
     cli_len = sizeof(cli);
@@ -344,7 +346,7 @@ void mbtcp_task(void *argument)
       HAL_UART_Transmit(&huart1, (uint8_t*)line, (uint16_t)len, HAL_MAX_DELAY);
     }
 
-    /* 设为非阻塞：收/发都由上面的带超时循环处理，客户端半死不会卡住本任务 */
+    /* 设为非阻塞：收/发都由上面的带超时循环处理 */
     {
       int nb = 1;
       (void)lwip_ioctl(conn_fd, FIONBIO, &nb);
@@ -356,12 +358,12 @@ void mbtcp_task(void *argument)
       uint16_t pid, alen;
       int pdu_len, rlen, r;
 
-      /* 1) 先收 7 字节 MBAP，取出“长度”字段（空闲最多等 30s） */
+      /* 1) 先收 7 字节 MBAP，取出"长度"字段（空闲最多等 30s） */
       r = recv_exact(conn_fd, req, 7, 30000);
       if (r <= 0) break;
 
-      pid  = rd_u16(req + 2);
-      alen = rd_u16(req + 4);            /* = 单元号 + PDU */
+      pid  = rd_u16(req + 2);            /* 协议号 */
+      alen = rd_u16(req + 4);            /* 长度 = 单元号 + PDU */
 
       if (pid != 0 || alen < 2 || alen > 254)
       {
@@ -376,7 +378,7 @@ void mbtcp_task(void *argument)
       /* 3) 解析并生成应答 */
       rlen = modbus_handle(req, 7 + pdu_len, resp);
 
-      /* 4) 发送应答 */
+      /* 4) 发送应答（rlen=0 表示忽略该请求） */
       if (rlen > 0)
       {
         if (send_all(conn_fd, resp, rlen) < 0) break;
@@ -384,7 +386,5 @@ void mbtcp_task(void *argument)
     }
 
     lwip_close(conn_fd);
-    HAL_UART_Transmit(&huart1, (uint8_t*)"[MB] closed\r\n",
-                      (uint16_t)strlen("[MB] closed\r\n"), HAL_MAX_DELAY);
   }
 }

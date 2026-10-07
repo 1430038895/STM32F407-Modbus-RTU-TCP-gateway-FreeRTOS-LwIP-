@@ -29,11 +29,11 @@
 #include <stdio.h>
 #include "usart.h"
 #include "iwdg.h"
-#include "mb_rtu.h"
-#include "mb_tcp.h"
-#include "mb_gateway.h"
-#include "joystick.h"
-#include "ui.h"
+#include "mb_rtu.h"       /* mbrtu_init */
+#include "mb_tcp.h"       /* mbtcp_task */
+#include "mb_gateway.h"   /* mbgw_init / mbgw_poll_task / mbgw_dump_task / mbgw_last_alive_ms */
+#include "joystick.h"     /* joystick（界面在 ui.c 里用） */
+#include "ui.h"           /* ui_init / ui_poll */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -53,14 +53,14 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-/* ---- 任务句柄与属性（name / stack_size[字节] / priority） ---- */
+/* ---- 任务句柄与属性：stack_size 单位是“字节”，priority 是 CMSIS 优先级 ---- */
 
 /** Modbus TCP 服务器任务（上行，对电脑） */
 osThreadId_t tcpTaskHandle;
 const osThreadAttr_t tcpTask_attributes = {
   .name = "tcpTask",
-  .stack_size = 4096,
-  .priority = (osPriority_t) osPriorityBelowNormal, /* 低于 defaultTask，保证 LWIP 先初始化 */
+  .stack_size = 4096,                                  /* 4KB 栈 */
+  .priority = (osPriority_t) osPriorityBelowNormal,    /* 低于 defaultTask，保证 LWIP 先初始化 */
 };
 
 /** Modbus RTU 主站轮询任务（下行，对从机） */
@@ -68,7 +68,7 @@ osThreadId_t rs485TaskHandle;
 const osThreadAttr_t rs485Task_attributes = {
   .name = "rs485Task",
   .stack_size = 4096,
-  .priority = (osPriority_t) osPriorityAboveNormal, /* 高于屏幕任务：轮询时不被屏幕打断 */
+  .priority = (osPriority_t) osPriorityAboveNormal,    /* 高于屏幕任务：轮询时不被屏幕打断 */
 };
 
 /** 看门狗任务（检查轮询任务心跳，健康才喂狗） */
@@ -76,7 +76,7 @@ osThreadId_t wdTaskHandle;
 const osThreadAttr_t wdTask_attributes = {
   .name = "wdTask",
   .stack_size = 512,
-  .priority = (osPriority_t) osPriorityAboveNormal, /* 高于轮询/网络任务，保证按时喂狗 */
+  .priority = (osPriority_t) osPriorityAboveNormal,    /* 高于轮询/网络任务，保证按时喂狗 */
 };
 
 /** 数据导出任务（TCP 5000，给 Python / 屏幕读全部点） */
@@ -84,14 +84,14 @@ osThreadId_t dumpTaskHandle;
 const osThreadAttr_t dumpTask_attributes = {
   .name = "dumpTask",
   .stack_size = 4096,
-  .priority = (osPriority_t) osPriorityNormal, /* 要能抢过轮询任务，及时应答 */
+  .priority = (osPriority_t) osPriorityNormal,         /* 要能抢过轮询任务，及时应答 */
 };
 /* USER CODE END Variables */
-/* Definitions for defaultTask */
+/* Definitions for defaultTask（界面任务；CubeMX 生成） */
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 512 * 4,
+  .stack_size = 512 * 4,                               /* 2KB 栈：里面要做 MX_LWIP_Init，别太小 */
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -108,9 +108,10 @@ extern void MX_LWIP_Init(void);
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
 /**
-  * @brief  FreeRTOS initialization
+  * @brief  FreeRTOS 初始化：初始化各模块 + 创建所有任务
   * @param  None
   * @retval None
+  * @note   在 osKernelStart() 之前被 main() 调用。
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
@@ -119,8 +120,8 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* 初始化各模块（内部各自创建所需的互斥锁） */
-  mbrtu_init();     /* RS485 总线互斥锁 */
-  mbgw_init();      /* 缓存互斥锁 */
+  mbrtu_init();     /* RS485 总线互斥锁 + 启动 UART5 接收中断 */
+  mbgw_init();      /* 缓存互斥锁/事件标志 + 解析描述表生成点表 */
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -170,11 +171,11 @@ void StartDefaultTask(void *argument)
   /* init code for LWIP */
   MX_LWIP_Init();
   /* USER CODE BEGIN StartDefaultTask */
-  st7789_dma_init();         /* 启动屏幕 SPI DMA */
+  st7789_dma_init();         /* 启动屏幕 SPI DMA（要用 osSemaphoreNew，必须在调度器起来后） */
   ui_init();                 /* 清屏 + 画标题/列表/数据 */
   for(;;)
   {
-    ui_poll();               /* 摇杆上下切换从机；选中变化时重画 */
+    ui_poll();               /* 摇杆上下切换从机；周期刷新 */
     osDelay(20);
   }
   /* USER CODE END StartDefaultTask */
@@ -184,10 +185,10 @@ void StartDefaultTask(void *argument)
 /* USER CODE BEGIN Application */
 
 /**
-  * @brief  Modbus TCP 服务器任务（上行，对电脑）
+  * @brief  Modbus TCP 服务器任务壳（上行，对电脑）
   * @param  argument  未使用
   * @retval 无（任务永不返回）
-  * @note   任务壳：调用 mb_tcp 模块的服务器循环。
+  * @note   直接进入 mb_tcp 模块的服务器循环。
   */
 void StartTcpTask(void *argument)
 {
@@ -195,10 +196,10 @@ void StartTcpTask(void *argument)
 }
 
 /**
-  * @brief  Modbus RTU 主站轮询任务（下行，对从机）
+  * @brief  Modbus RTU 主站轮询任务壳（下行，对从机）
   * @param  argument  未使用
   * @retval 无（任务永不返回）
-  * @note   任务壳：调用 mb_gateway 模块的轮询循环。
+  * @note   直接进入 mb_gateway 模块的轮询循环。
   */
 void StartRs485Task(void *argument)
 {
@@ -266,4 +267,3 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 }
 
 /* USER CODE END Application */
-

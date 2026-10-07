@@ -17,10 +17,9 @@ MDK-ARM/*.build_log.htm
 # Keil 个人窗口布局（每台电脑不同，不提交）
 MDK-ARM/*.uvguix.*
 
-# ========== CMake / GCC 构建产物 ==========
-build/
-cmake-build-*/
-out/
+# ========== Python 缓存 ==========
+__pycache__/
+*.pyc
 
 # ========== CubeMX 辅助文件 ==========
 .mxproject
