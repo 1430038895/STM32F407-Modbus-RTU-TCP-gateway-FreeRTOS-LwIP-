@@ -9,6 +9,8 @@
 ![IDE](https://img.shields.io/badge/IDE-Keil%20MDK-orange)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
+**演示视频（Bilibili）**：[STM32F407 Modbus 网关演示](https://www.bilibili.com/video/BV1EaHy61EsP/)
+
 ---
 
 ## 亮点（作品集）
@@ -181,6 +183,12 @@ modbus/
 
 ---
 
-## 10. 许可证
+## 10. 演示
+
+- **Bilibili 演示视频**：<https://www.bilibili.com/video/BV1EaHy61EsP/>
+
+---
+
+## 11. 许可证
 
 MIT License（见 `LICENSE`）。
